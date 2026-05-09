@@ -23,17 +23,18 @@ HTML_TEMPLATE = '''
         input[type="file"] { margin: 20px 0; }
         button { background-color: #27ae60; color: white; border: none; padding: 12px 24px; border-radius: 6px; cursor: pointer; font-size: 16px; transition: background 0.3s; }
         button:hover { background-color: #219150; }
+        button:disabled { background-color: #95a5a6; cursor: not-allowed; }
         #progress-container { display: none; margin-top: 30px; }
         .progress-bg { width: 100%; background: #dfe6e9; border-radius: 20px; height: 25px; margin: 15px 0; overflow: hidden; }
         #bar { width: 0%; height: 100%; background: #2980b9; transition: width 0.5s ease; }
-        #download-btn { display: none; margin-top: 20px; display: inline-block; padding: 12px 24px; background: #2980b9; color: white; text-decoration: none; border-radius: 6px; font-weight: bold; }
+        #download-btn { display: none; margin-top: 20px; padding: 12px 24px; background: #2980b9; color: white; text-decoration: none; border-radius: 6px; font-weight: bold; }
         #download-btn:hover { background: #3498db; }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>Bulk BG Remover</h1>
-        <p>Select images for your catalog and click Generate.</p>
+        <p>Select images and click Generate.</p>
         
         <form id="upload-form">
             <input type="file" id="file-input" multiple required>
@@ -62,14 +63,13 @@ HTML_TEMPLATE = '''
             const formData = new FormData();
             for (let f of files) { formData.append('file', f); }
 
-            // Start Job
             const res = await fetch('/', { method: 'POST', body: formData });
             const { job_id } = await res.json();
 
             document.getElementById('progress-container').style.display = 'block';
             document.getElementById('download-btn').style.display = 'none';
+            document.getElementById('status-text').innerText = "Working on images...";
             
-            // Poll Status
             const interval = setInterval(async () => {
                 const sRes = await fetch('/status/' + job_id);
                 const data = await sRes.json();
@@ -89,7 +89,9 @@ HTML_TEMPLATE = '''
                 }
                 if (progress === -1) {
                     clearInterval(interval);
-                    alert("An error occurred during processing.");
+                    alert("An error occurred. Check if your API credits are exhausted.");
+                    genBtn.disabled = false;
+                    genBtn.innerText = "Generate";
                 }
             }, 5000);
         };
@@ -104,29 +106,44 @@ def background_worker(files_data, job_id):
     total_files = len(files_data)
     
     try:
-        with zipfile.ZipFile(temp_path, 'w') as zip_file:
-            for index, (filename, content) in enumerate(files_data):
-                # Update progress tracker
-                progress_tracker[job_id] = int((index / total_files) * 100)
-                
-                try:
-                    output = replicate.run(
-                        "851-labs/background-remover:a029dff38972b5fda4ec5d75d7d1cd25aeff621d2cf4946a41055d7db66b80bc",
-                        input={"image": io.BytesIO(content), "format": "png", "background_type": "white"}
-                    )
-                    img_url = output if isinstance(output, str) else output[0]
-                    zip_file.writestr(f"white_bg_{filename}", requests.get(img_url).content)
-                    
-                    if index < total_files - 1:
-                        time.sleep(11) # Maintain for credit safety
-                except Exception as e:
-                    print(f"Error on {filename}: {e}")
+        # Open ZIP with compression enabled
+        zip_file = zipfile.ZipFile(temp_path, 'w', compression=zipfile.ZIP_DEFLATED)
         
-        # Atomically rename to .zip so the download link works
-        os.rename(temp_path, final_path)
-        progress_tracker[job_id] = 100
+        for index, (filename, content) in enumerate(files_data):
+            progress_tracker[job_id] = int((index / total_files) * 100)
+            
+            try:
+                # Call Replicate API
+                output = replicate.run(
+                    "851-labs/background-remover:a029dff38972b5fda4ec5d75d7d1cd25aeff621d2cf4946a41055d7db66b80bc",
+                    input={"image": io.BytesIO(content), "format": "png", "background_type": "white"}
+                )
+                
+                img_url = output if isinstance(output, str) else output[0]
+                img_data = requests.get(img_url).content
+                
+                if len(img_data) > 0:
+                    zip_file.writestr(f"white_bg_{filename}", img_data)
+                
+                if index < total_files - 1:
+                    time.sleep(11) # Maintain for credit safety
+                    
+            except Exception as e:
+                print(f"File Error ({filename}): {e}")
+
+        # CRITICAL: Close and force write to disk
+        zip_file.close()
+        time.sleep(2) 
+
+        # Final check: Ensure the file is not empty before renaming
+        if os.path.exists(temp_path) and os.path.getsize(temp_path) > 100:
+            os.rename(temp_path, final_path)
+            progress_tracker[job_id] = 100
+        else:
+            progress_tracker[job_id] = -1
+
     except Exception as e:
-        print(f"Worker Error: {e}")
+        print(f"Worker Crash: {e}")
         progress_tracker[job_id] = -1
 
 @app.route('/', methods=['GET', 'POST'])
